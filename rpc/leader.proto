@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package cluster.rpc;
+
+message Term {
+    repeated uint64 counter = 1;
+}
+
+message ClusterId {
+    string host = 1;
+    fixed32 port = 2;
+}
+
+message Request {
+    Term term = 1;
+    ClusterId from = 2;
+}
+
+message Response {
+    Term term = 1;
+    ClusterId from = 2;
+}
+
+message Heartbeat {
+    Term term = 1;
+    ClusterId from = 2;
+}
+
+message NetworkStateRequest {
+    ClusterId from = 1;
+}
+
+message NetworkStateResponse {
+    Term term = 1;
+    ClusterId from = 2;
+    repeated ClusterId clusters = 3;
+    ClusterId leader = 4;
+}
+
+// Cluster management service: using Raft Leader Election algorithm
+service ManagementService {
+    rpc GetNetworkState (NetworkStateRequest) returns (NetworkStateResponse);
+
+    rpc GreetAsCandidate (Request) returns (Response);
+    rpc GreetAsLeader (Request) returns (Response);
+
+    rpc PulseMonitor (Heartbeat) returns (Heartbeat);
+}
