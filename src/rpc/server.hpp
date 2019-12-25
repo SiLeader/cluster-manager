@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <random>
 #include <thread>
 
 #include <grpc++/grpc++.h>
@@ -55,6 +56,18 @@ namespace cluster::rpc {
 
     inline bool operator==(const ClusterId &lhs, const ClusterId &rhs) {
         return lhs.port() == rhs.port() && lhs.host() == rhs.host();
+    }
+
+    inline void Increment(cluster::rpc::Term &term) {
+        for (std::size_t i = 0; i < term.counter_size(); ++i) {
+            auto value = term.counter(i);
+            if (value != std::numeric_limits<decltype(value)>::max()) {
+                term.set_counter(i, ++value);
+                return;
+            }
+            term.set_counter(i, 0);
+        }
+        term.add_counter(0);
     }
 
     class LeaderRpc : public ManagementService::Service {
@@ -125,7 +138,73 @@ namespace cluster::rpc {
         }
 
     private:
-        void doElection() { std::cout << "Begin election" << std::endl; }
+        void doElection() {
+            static std::mt19937 mt(std::random_device{}());
+            static std::uniform_int_distribution<> rand(1, 1000);
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(rand(mt)));
+            _currentStatus = Status::Candidate;
+            Increment(_currentTerm);
+
+            for (const auto &cr : _belonging) {
+                grpc::ClientContext ctx;
+                Request req;
+                *req.mutable_from() = _myself;
+                *req.mutable_term() = _currentTerm;
+
+                Response res;
+                if (!cr.second) {
+                    continue;
+                }
+                auto status = cr.second->stub->GreetAsCandidate(&ctx, req, &res);
+
+                switch (status.error_code()) {
+                case ::grpc::StatusCode::FAILED_PRECONDITION:
+                case ::grpc::StatusCode::DEADLINE_EXCEEDED:
+                    _currentStatus = Status::Follower;
+                    joinToNetwork(cr.first);
+                    goto end_election;
+
+                case ::grpc::StatusCode::ALREADY_EXISTS:
+                    doElection();
+                    return;
+
+                default:
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(rand(mt)));
+
+            for (const auto &cr : _belonging) {
+                grpc::ClientContext ctx;
+                Request req;
+                *req.mutable_from() = _myself;
+                *req.mutable_term() = _currentTerm;
+
+                Response res;
+                if (!cr.second) {
+                    continue;
+                }
+                auto status = cr.second->stub->GreetAsLeader(&ctx, req, &res);
+
+                switch (status.error_code()) {
+                case ::grpc::StatusCode::FAILED_PRECONDITION:
+                case ::grpc::StatusCode::DEADLINE_EXCEEDED:
+                    _currentStatus = Status::Follower;
+                    joinToNetwork(cr.first);
+                    goto end_election;
+
+                default:
+                    break;
+                }
+            }
+
+            _currentStatus = Status::Leader;
+            _currentLeader = _myself;
+
+        end_election:
+            return;
+        }
 
     public:
         void runHeartbeat() {
@@ -143,8 +222,6 @@ namespace cluster::rpc {
 
                     grpc::ClientContext ctx;
                     if (likely(rpc->stub->PulseMonitor(&ctx, hb, &res).ok())) {
-                        std::cout << cr.first.host() << ":" << cr.first.port() << " "
-                                  << (cr.second == nullptr) << std::endl;
                         continue;
                     }
 
@@ -154,9 +231,9 @@ namespace cluster::rpc {
                         doElection();
                     }
                 }
+                rehashNetwork(_currentLeader);
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
-            std::cout << "exited " << _isRunning << std::endl;
         }
 
         void startHeartbeat() {
@@ -193,6 +270,22 @@ namespace cluster::rpc {
         }
 
     public:
+        bool rehashNetwork(const ClusterId &belongingCluster) {
+            if (_currentLeader == _myself) {
+                std::vector<ClusterId> unavailableClusters;
+                for (const auto &cr : _belonging) {
+                    if (!(cr.second && joinToNetwork(cr.first))) {
+                        unavailableClusters.emplace_back(cr.first);
+                    }
+                }
+                for (const auto &uc : unavailableClusters) {
+                    _belonging.erase(uc);
+                }
+                return true;
+            }
+            return joinToNetwork(belongingCluster);
+        }
+
         bool joinToNetwork(const ClusterId &belongingCluster) {
             auto rc = std::make_shared<RpcClient>(belongingCluster);
 
@@ -208,8 +301,10 @@ namespace cluster::rpc {
                 return false;
             }
 
-            std::cout << res.clusters().size() << std::endl;
             for (const auto &cluster : res.clusters()) {
+                if (unlikely(cluster == _myself)) {
+                    continue;
+                }
                 _belonging.emplace(cluster, std::make_shared<RpcClient>(cluster));
             }
             _currentLeader = res.leader();
@@ -246,7 +341,7 @@ namespace cluster::rpc {
                 *response->mutable_term() = _currentTerm;
                 switch (_currentStatus) {
                 case Status::Candidate:
-                    return ::grpc::Status(::grpc::StatusCode::UNAVAILABLE,
+                    return ::grpc::Status(::grpc::StatusCode::ALREADY_EXISTS,
                                           "I am Candidate on specified term.");
                 case Status::Leader:
                     return ::grpc::Status(::grpc::StatusCode::FAILED_PRECONDITION,
